@@ -1,0 +1,411 @@
+name: Build PostmarketOS for NX669S
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Setup build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git curl wget build-essential bc bison flex libssl-dev libelf-dev python3 python3-pip cpio gzip lz4 gcc-aarch64-linux-gnu device-tree-compiler libncurses-dev
+        git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg-tools
+        pip3 install pmbootstrap
+        
+    - name: Clone SM8350 mainline kernel
+      run: |
+        # Use mainline kernel with SM8350 support
+        git clone --depth=1 -b master https://github.com/jhovold/linux.git -b wip/sc8280xp-v6.7 kernel-mainline || \
+        git clone --depth=1 https://github.com/nicofee-nicofee/linux-msm.git kernel-mainline || \
+        git clone --depth=1 -b linux-6.6.y https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git kernel-mainline
+        
+    - name: Create NX669S device tree
+      run: |
+        mkdir -p kernel-mainline/arch/arm64/boot/dts/qcom
+        
+        # Create basic SM8350 NX669S device tree
+        cat > kernel-mainline/arch/arm64/boot/dts/qcom/sm8350-nubia-nx669s.dts << 'DEVICETREE'
+        // SPDX-License-Identifier: BSD-3-Clause
+        /dts-v1/;
+        
+        #include "sm8350.dtsi"
+        #include "pm8350.dtsi"
+        #include "pm8350b.dtsi"
+        #include "pm8350c.dtsi"
+        #include "pmk8350.dtsi"
+        #include "pmr735a.dtsi"
+        #include "pmr735b.dtsi"
+        
+        / {
+            model = "Nubia Red Magic 6S Pro";
+            compatible = "nubia,nx669s", "qcom,sm8350";
+            chassis-type = "handset";
+            
+            chosen {
+                #address-cells = <2>;
+                #size-cells = <2>;
+                ranges;
+                
+                framebuffer: framebuffer@e1000000 {
+                    compatible = "simple-framebuffer";
+                    reg = <0x0 0xe1000000 0x0 0x2300000>;
+                    width = <1080>;
+                    height = <2400>;
+                    stride = <(1080 * 4)>;
+                    format = "a8r8g8b8";
+                    status = "okay";
+                };
+            };
+            
+            reserved-memory {
+                cont_splash_mem: cont-splash@e1000000 {
+                    reg = <0x0 0xe1000000 0x0 0x2300000>;
+                    no-map;
+                };
+            };
+        };
+        
+        &apps_rsc {
+            regulators-0 {
+                compatible = "qcom,pm8350-rpmh-regulators";
+                qcom,pmic-id = "b";
+                
+                vreg_l1b: ldo1 {
+                    regulator-name = "vreg_l1b";
+                    regulator-min-microvolt = <912000>;
+                    regulator-max-microvolt = <920000>;
+                };
+            };
+        };
+        
+        &tlmm {
+            gpio-reserved-ranges = <52 8>;
+        };
+        
+        &ufs_mem_hc {
+            status = "okay";
+        };
+        
+        &ufs_mem_phy {
+            status = "okay";
+        };
+        
+        &usb_1 {
+            status = "okay";
+        };
+        
+        &usb_1_dwc3 {
+            dr_mode = "peripheral";
+        };
+        
+        &usb_1_hsphy {
+            status = "okay";
+        };
+        
+        &usb_1_qmpphy {
+            status = "okay";
+        };
+        DEVICETREE
+        
+    - name: Configure kernel for PostmarketOS
+      run: |
+        cd kernel-mainline
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        
+        # Use defconfig and add pmos configs
+        make defconfig
+        
+        cat >> .config << 'PMOSCONFIG'
+        # PostmarketOS required
+        CONFIG_DEVTMPFS=y
+        CONFIG_DEVTMPFS_MOUNT=y
+        CONFIG_BLK_DEV_INITRD=y
+        CONFIG_RD_GZIP=y
+        CONFIG_TMPFS=y
+        CONFIG_TMPFS_POSIX_ACL=y
+        CONFIG_VT=y
+        CONFIG_VT_CONSOLE=y
+        CONFIG_UNIX98_PTYS=y
+        CONFIG_EXT4_FS=y
+        CONFIG_F2FS_FS=y
+        CONFIG_VFAT_FS=y
+        
+        # USB gadget
+        CONFIG_USB_GADGET=y
+        CONFIG_USB_CONFIGFS=y
+        CONFIG_USB_CONFIGFS_SERIAL=y
+        CONFIG_USB_CONFIGFS_ACM=y
+        CONFIG_USB_CONFIGFS_RNDIS=y
+        CONFIG_USB_CONFIGFS_EEM=y
+        CONFIG_USB_CONFIGFS_ECM=y
+        CONFIG_USB_ETH=m
+        CONFIG_USB_G_SERIAL=m
+        
+        # Qualcomm
+        CONFIG_ARCH_QCOM=y
+        CONFIG_QCOM_SMEM=y
+        CONFIG_QCOM_SCM=y
+        CONFIG_QCOM_RPMH=y
+        CONFIG_QCOM_PDC=y
+        CONFIG_QCOM_LLCC=y
+        CONFIG_QCOM_COMMAND_DB=y
+        
+        # Display
+        CONFIG_DRM=y
+        CONFIG_DRM_MSM=y
+        CONFIG_DRM_PANEL_SIMPLE=y
+        CONFIG_FB=y
+        CONFIG_FB_SIMPLE=y
+        CONFIG_FRAMEBUFFER_CONSOLE=y
+        
+        # Input
+        CONFIG_INPUT_EVDEV=y
+        CONFIG_INPUT_TOUCHSCREEN=y
+        CONFIG_TOUCHSCREEN_EDT_FT5X06=y
+        
+        # Network
+        CONFIG_NET=y
+        CONFIG_INET=y
+        CONFIG_IPV6=y
+        CONFIG_NETDEVICES=y
+        CONFIG_USB_NET_DRIVERS=y
+        CONFIG_USB_RTL8152=m
+        PMOSCONFIG
+        
+        make olddefconfig
+        
+    - name: Build kernel
+      run: |
+        cd kernel-mainline
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        make -j$(nproc) Image.gz dtbs || make -j$(nproc) Image
+        ls -la arch/arm64/boot/
+        
+    - name: Download PostmarketOS rootfs
+      run: |
+        # Download Alpine-based PostmarketOS rootfs
+        mkdir -p pmos-rootfs
+        wget -q "https://images.postmarketos.org/bpo/edge/qcom-sm8350/phosh/postmarketos-edge-qcom-sm8350-phosh.img.xz" -O pmos.img.xz || \
+        wget -q "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.0-aarch64.tar.gz" -O alpine-rootfs.tar.gz
+        
+        if [ -f alpine-rootfs.tar.gz ]; then
+          mkdir -p pmos-rootfs
+          tar -xzf alpine-rootfs.tar.gz -C pmos-rootfs
+        fi
+        
+    - name: Create PostmarketOS initramfs
+      run: |
+        mkdir -p pmos-initramfs/{bin,sbin,etc,proc,sys,dev,mnt,tmp,run,lib,usr/bin,usr/sbin}
+        
+        # Download busybox
+        wget -q "https://www.busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox" -O pmos-initramfs/bin/busybox || \
+        wget -q "https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox-armv8l" -O pmos-initramfs/bin/busybox
+        chmod +x pmos-initramfs/bin/busybox
+        
+        # Create symlinks
+        cd pmos-initramfs/bin
+        for cmd in sh ash cat cp dd echo ls mkdir mount umount ln rm sleep switch_root mknod chmod chown ifconfig ip; do
+          ln -sf busybox $cmd
+        done
+        cd ../sbin
+        for cmd in init mount umount switch_root mdev; do
+          ln -sf ../bin/busybox $cmd
+        done
+        cd ../..
+        
+        # Create PostmarketOS init
+        cat > pmos-initramfs/init << 'PMOSINIT'
+        #!/bin/sh
+        export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+        
+        mount -t proc proc /proc
+        mount -t sysfs sysfs /sys
+        mount -t devtmpfs devtmpfs /dev
+        mount -t tmpfs tmpfs /tmp
+        mount -t tmpfs tmpfs /run
+        
+        # Parse cmdline
+        for x in $(cat /proc/cmdline); do
+          case "$x" in
+            pmos_root=*) PMOS_ROOT="${x#pmos_root=}" ;;
+            pmos_boot=*) PMOS_BOOT="${x#pmos_boot=}" ;;
+          esac
+        done
+        
+        echo "=== PostmarketOS NX669S ===" > /dev/kmsg
+        
+        # USB Peripheral mode for Qualcomm
+        echo "peripheral" > /sys/bus/platform/devices/a600000.ssusb/mode 2>/dev/null
+        
+        # Setup USB network (RNDIS)
+        mkdir -p /config
+        mount -t configfs none /config 2>/dev/null
+        
+        USB=/config/usb_gadget/g1
+        mkdir -p $USB
+        echo 0x18D1 > $USB/idVendor
+        echo 0x4EE0 > $USB/idProduct
+        mkdir -p $USB/strings/0x409
+        echo "PostmarketOS" > $USB/strings/0x409/manufacturer
+        echo "NX669S" > $USB/strings/0x409/product
+        mkdir -p $USB/functions/rndis.usb0
+        mkdir -p $USB/configs/c.1/strings/0x409
+        echo "rndis" > $USB/configs/c.1/strings/0x409/configuration
+        ln -sf $USB/functions/rndis.usb0 $USB/configs/c.1/ 2>/dev/null
+        UDC=$(ls /sys/class/udc/ | head -1)
+        echo "$UDC" > $USB/UDC 2>/dev/null
+        
+        sleep 2
+        
+        # Setup network
+        ifconfig usb0 172.16.42.1 netmask 255.255.255.0 2>/dev/null
+        ifconfig rndis0 172.16.42.1 netmask 255.255.255.0 2>/dev/null
+        
+        # Telnet debug
+        /bin/busybox telnetd -l /bin/sh -p 23 2>/dev/null &
+        
+        echo "Telnet: 172.16.42.1:23" > /dev/kmsg
+        
+        # Try mounting rootfs
+        mkdir -p /mnt/root
+        
+        # Try userdata partition
+        mount /dev/disk/by-partlabel/userdata /mnt/root -t f2fs 2>/dev/null || \
+        mount /dev/block/by-name/userdata /mnt/root -t f2fs 2>/dev/null
+        
+        if [ -f /mnt/root/pmos-rootfs.img ]; then
+          echo "Found PostmarketOS rootfs" > /dev/kmsg
+          mkdir -p /mnt/pmos
+          mount -o loop /mnt/root/pmos-rootfs.img /mnt/pmos
+          
+          if [ -x /mnt/pmos/sbin/init ]; then
+            mount --move /dev /mnt/pmos/dev
+            mount --move /proc /mnt/pmos/proc
+            mount --move /sys /mnt/pmos/sys
+            exec switch_root /mnt/pmos /sbin/init
+          fi
+        fi
+        
+        # Fallback shell
+        echo "Dropping to shell..." > /dev/kmsg
+        exec /bin/sh
+        PMOSINIT
+        
+        chmod +x pmos-initramfs/init
+        
+        # Create initramfs
+        cd pmos-initramfs
+        find . | cpio -o -H newc 2>/dev/null | gzip > ../pmos-initramfs.cpio.gz
+        cd ..
+        ls -la pmos-initramfs.cpio.gz
+        
+    - name: Create boot image
+      run: |
+        KERNEL=$(find kernel-mainline/arch/arm64/boot -name "Image*" | head -1)
+        
+        python3 mkbootimg-tools/mkbootimg.py \
+          --kernel $KERNEL \
+          --ramdisk pmos-initramfs.cpio.gz \
+          --base 0x00000000 \
+          --kernel_offset 0x00008000 \
+          --ramdisk_offset 0x01000000 \
+          --pagesize 4096 \
+          --header_version 3 \
+          --cmdline "console=ttyMSM0,115200n8 pd_ignore_unused clk_ignore_unused pmos_boot=/dev/sda1 pmos_root=/dev/sda2" \
+          --os_version 12.0.0 \
+          --os_patch_level 2024-01 \
+          -o postmarketos-nx669s.img
+          
+        truncate -s 100663296 postmarketos-nx669s.img
+        ls -la postmarketos-nx669s.img
+        
+    - name: Create Alpine rootfs image
+      run: |
+        # Create minimal Alpine rootfs image
+        dd if=/dev/zero of=pmos-rootfs.img bs=1M count=512
+        mkfs.ext4 -L pmos pmos-rootfs.img
+        
+        mkdir -p mnt
+        sudo mount -o loop pmos-rootfs.img mnt
+        
+        if [ -d pmos-rootfs ]; then
+          sudo cp -a pmos-rootfs/* mnt/
+        fi
+        
+        # Add postmarketOS packages list
+        sudo mkdir -p mnt/etc/apk
+        echo "https://dl-cdn.alpinelinux.org/alpine/edge/main" | sudo tee mnt/etc/apk/repositories
+        echo "https://dl-cdn.alpinelinux.org/alpine/edge/community" | sudo tee -a mnt/etc/apk/repositories
+        
+        sudo umount mnt
+        ls -la pmos-rootfs.img
+        
+    - name: Upload PostmarketOS boot
+      uses: actions/upload-artifact@v4
+      with:
+        name: postmarketos-nx669s-boot
+        path: postmarketos-nx669s.img
+        
+    - name: Upload PostmarketOS rootfs
+      uses: actions/upload-artifact@v4
+      with:
+        name: postmarketos-nx669s-rootfs
+        path: pmos-rootfs.img
+        
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: pmos-v${{ github.run_number }}
+        name: PostmarketOS NX669S v${{ github.run_number }}
+        files: |
+          postmarketos-nx669s.img
+          pmos-rootfs.img
+        body: |
+          ## PostmarketOS for NX669S (Red Magic 6S Pro)
+          
+          ### Files:
+          - `postmarketos-nx669s.img` - Boot image with mainline kernel
+          - `pmos-rootfs.img` - Alpine Linux rootfs (512MB)
+          
+          ### Installation:
+          1. Copy `pmos-rootfs.img` to device:
+             ```
+             adb push pmos-rootfs.img /sdcard/
+             adb shell mv /sdcard/pmos-rootfs.img /data/
+             ```
+          
+          2. Boot PostmarketOS:
+             ```
+             fastboot boot postmarketos-nx669s.img
+             ```
+          
+          3. Connect via USB network:
+             ```
+             # Set PC IP to 172.16.42.2
+             telnet 172.16.42.1
+             ```
+          
+          ### Features:
+          - Mainline Linux kernel
+          - USB RNDIS network
+          - Telnet debug shell
+          - Alpine Linux base
+          
+          ### Status:
+          - USB: Should work
+          - Display: Simple framebuffer (may need tuning)
+          - Touch: Untested
+          - WiFi/BT: Not working (needs firmware)
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
