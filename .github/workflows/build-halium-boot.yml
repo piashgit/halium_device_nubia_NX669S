@@ -25,12 +25,16 @@ jobs:
           git curl wget \
           build-essential bc bison flex libssl-dev \
           libelf-dev python3 python3-pip \
-          abootimg mkbootimg cpio gzip lz4 \
+          cpio gzip lz4 \
           device-tree-compiler gcc-aarch64-linux-gnu \
           crossbuild-essential-arm64
         
         # Install mkbootimg from Android tools
         pip3 install mkbootimg
+        
+        # Clone Android mkbootimg tools
+        git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg-tools
+        chmod +x mkbootimg-tools/*.py
         
     - name: Clone kernel source
       run: |
@@ -39,35 +43,32 @@ jobs:
           
     - name: Setup Halium initramfs
       run: |
-        # Clone halium-boot (generic initramfs)
-        git clone --depth=1 https://github.com/halium/initramfs-tools-halium halium-initramfs
-        
         # Create minimal halium ramdisk
-        mkdir -p ramdisk/{dev,proc,sys,system,data,vendor}
+        mkdir -p ramdisk/{dev,proc,sys,system,data,vendor,sbin,bin}
         
         # Create init script for Halium
         cat > ramdisk/init << 'INITEOF'
-        #!/bin/sh
-        
-        mount -t proc proc /proc
-        mount -t sysfs sysfs /sys
-        mount -t devtmpfs devtmpfs /dev
-        
-        # Halium boot
-        export PATH=/sbin:/bin:/usr/sbin:/usr/bin
-        
-        # Mount system
-        mount -o ro /dev/block/by-name/system_a /system 2>/dev/null || \
-        mount -o ro /dev/block/by-name/system /system
-        
-        # Switch root to Ubuntu Touch
-        if [ -f /system/ubuntu/init ]; then
-            exec switch_root /system/ubuntu /init
-        fi
-        
-        # Fallback - start shell
-        exec /bin/sh
-        INITEOF
+#!/bin/sh
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+
+# Halium boot
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+# Mount system
+mount -o ro /dev/block/by-name/system_a /system 2>/dev/null || \
+mount -o ro /dev/block/by-name/system /system
+
+# Switch root to Ubuntu Touch
+if [ -f /system/ubuntu/init ]; then
+    exec switch_root /system/ubuntu /init
+fi
+
+# Fallback - start shell
+exec /bin/sh
+INITEOF
         chmod +x ramdisk/init
         
     - name: Build kernel
@@ -77,37 +78,52 @@ jobs:
         export SUBARCH=arm64
         export CROSS_COMPILE=aarch64-linux-gnu-
         
-        # Use NX669S defconfig
-        make O=out vendor/lahaina-qgki_defconfig vendor/lahaina-NX669S_diff
+        # Check available configs
+        ls -la arch/arm64/configs/vendor/ | head -20
+        
+        # Use NX669S defconfig - try different approaches
+        if [ -f arch/arm64/configs/vendor/lahaina-qgki_defconfig ]; then
+          make O=out vendor/lahaina-qgki_defconfig
+        elif [ -f arch/arm64/configs/lahaina_defconfig ]; then
+          make O=out lahaina_defconfig
+        else
+          # List available configs
+          echo "Available configs:"
+          find arch/arm64/configs -name "*lahaina*" -o -name "*NX669*" 2>/dev/null
+          make O=out defconfig
+        fi
         
         # Enable Halium required configs
         cat >> out/.config << 'CONFIGEOF'
-        # Halium required
-        CONFIG_VT=y
-        CONFIG_VT_CONSOLE=y
-        CONFIG_DEVTMPFS=y
-        CONFIG_DEVTMPFS_MOUNT=y
-        CONFIG_TMPFS=y
-        CONFIG_UNIX=y
-        CONFIG_SYSFS=y
-        CONFIG_PROC_FS=y
-        CONFIG_FHANDLE=y
-        CONFIG_CRYPTO_USER=y
-        CONFIG_NET=y
-        CONFIG_PACKET=y
-        CONFIG_UNIX_DIAG=y
-        CONFIG_NET_KEY=y
-        CONFIG_INET=y
-        CONFIG_IP_MULTICAST=y
-        CONFIG_IP_ADVANCED_ROUTER=y
-        CONFIG_IP_MULTIPLE_TABLES=y
-        CONFIG_NETFILTER=y
-        CONFIG_ANDROID_BINDER_IPC=y
-        CONFIG_ASHMEM=y
-        CONFIGEOF
+# Halium required
+CONFIG_VT=y
+CONFIG_VT_CONSOLE=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_TMPFS=y
+CONFIG_UNIX=y
+CONFIG_SYSFS=y
+CONFIG_PROC_FS=y
+CONFIG_FHANDLE=y
+CONFIG_CRYPTO_USER=y
+CONFIG_NET=y
+CONFIG_PACKET=y
+CONFIG_UNIX_DIAG=y
+CONFIG_NET_KEY=y
+CONFIG_INET=y
+CONFIG_IP_MULTICAST=y
+CONFIG_IP_ADVANCED_ROUTER=y
+CONFIG_IP_MULTIPLE_TABLES=y
+CONFIG_NETFILTER=y
+CONFIG_ANDROID_BINDER_IPC=y
+CONFIG_ASHMEM=y
+CONFIGEOF
         
-        # Build
-        make O=out -j$(nproc) Image
+        # Build kernel Image
+        make O=out -j$(nproc) Image || make O=out -j$(nproc) Image.gz
+        
+        # Check output
+        ls -la out/arch/arm64/boot/
         
     - name: Create Halium boot image
       run: |
@@ -116,11 +132,21 @@ jobs:
         find . | cpio -o -H newc | gzip > ../ramdisk.cpio.gz
         cd ..
         
-        # Get kernel
-        KERNEL=kernel/out/arch/arm64/boot/Image
+        # Get kernel - try different names
+        if [ -f kernel/out/arch/arm64/boot/Image ]; then
+          KERNEL=kernel/out/arch/arm64/boot/Image
+        elif [ -f kernel/out/arch/arm64/boot/Image.gz ]; then
+          KERNEL=kernel/out/arch/arm64/boot/Image.gz
+        else
+          echo "Kernel not found!"
+          find kernel/out -name "Image*" 2>/dev/null
+          exit 1
+        fi
+        
+        echo "Using kernel: $KERNEL"
         
         # Create boot.img with header v3 (Android 12)
-        python3 -m mkbootimg \
+        python3 mkbootimg-tools/mkbootimg.py \
           --kernel $KERNEL \
           --ramdisk ramdisk.cpio.gz \
           --base 0x00000000 \
