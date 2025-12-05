@@ -29,8 +29,6 @@ jobs:
           device-tree-compiler gcc-aarch64-linux-gnu \
           crossbuild-essential-arm64
         
-        pip3 install mkbootimg
-        
         git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg-tools
         chmod +x mkbootimg-tools/*.py
         
