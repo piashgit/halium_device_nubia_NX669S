@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 60
     
     steps:
     - name: Checkout
@@ -17,177 +17,130 @@ jobs:
     - name: Setup build environment
       run: |
         sudo apt-get update
-        sudo apt-get install -y git curl wget build-essential bc bison flex libssl-dev libelf-dev python3 python3-pip cpio gzip lz4 gcc-aarch64-linux-gnu device-tree-compiler libncurses-dev
+        sudo apt-get install -y wget python3 cpio gzip unzip
         git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg-tools
-        pip3 install pmbootstrap
         
-    - name: Clone kernel source
+    - name: Download OrangeFox Recovery
       run: |
-        # Use stock kernel (works with device)
-        git clone --depth=1 -b lineage-20 https://github.com/piashgit/android_kernel_nubia_sm8350.git kernel-mainline
+        # Download OrangeFox which has working kernel
+        wget -q "https://github.com/piashgit/halium_device_nubia_NX669S/releases/download/orangefox-kernel/orangefox.img" -O orangefox.img || \
+        wget --no-check-certificate -q "https://sourceforge.net/projects/nicofee-nicofee/files/NX669J/OrangeFox-12.1-Unofficial-Dr.Brown-NX669J.img/download" -O orangefox.img || \
+        exit 1
         
-    - name: Configure kernel for PostmarketOS
+        ls -la orangefox.img
+        
+    - name: Extract kernel
       run: |
-        cd kernel-mainline
-        export ARCH=arm64
-        export CROSS_COMPILE=aarch64-linux-gnu-
+        python3 mkbootimg-tools/unpack_bootimg.py --boot_img orangefox.img --out extracted
+        cp extracted/kernel kernel
+        ls -la kernel
         
-        # Use device defconfig
-        make O=out vendor/lahaina-qgki_defconfig
-        
-        cat >> out/.config << 'PMOSCONFIG'
-        CONFIG_DEVTMPFS=y
-        CONFIG_DEVTMPFS_MOUNT=y
-        CONFIG_BLK_DEV_INITRD=y
-        CONFIG_RD_GZIP=y
-        CONFIG_TMPFS=y
-        CONFIG_VT=y
-        CONFIG_VT_CONSOLE=y
-        CONFIG_EXT4_FS=y
-        CONFIG_F2FS_FS=y
-        PMOSCONFIG
-        
-        make O=out olddefconfig
-        
-    - name: Build kernel
+    - name: Download Alpine rootfs
       run: |
-        cd kernel-mainline
-        export ARCH=arm64
-        export CROSS_COMPILE=aarch64-linux-gnu-
-        make O=out -j$(nproc) Image
-        ls -la out/arch/arm64/boot/
-        
-    - name: Download PostmarketOS rootfs
-      run: |
-        # Download Alpine-based PostmarketOS rootfs
-        mkdir -p pmos-rootfs
-        wget -q "https://images.postmarketos.org/bpo/edge/qcom-sm8350/phosh/postmarketos-edge-qcom-sm8350-phosh.img.xz" -O pmos.img.xz || \
-        wget -q "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.0-aarch64.tar.gz" -O alpine-rootfs.tar.gz
-        
-        if [ -f alpine-rootfs.tar.gz ]; then
-          mkdir -p pmos-rootfs
-          tar -xzf alpine-rootfs.tar.gz -C pmos-rootfs
-        fi
+        wget -q "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.0-aarch64.tar.gz" -O alpine.tar.gz
+        mkdir -p alpine-rootfs
+        tar -xzf alpine.tar.gz -C alpine-rootfs
         
     - name: Create PostmarketOS initramfs
       run: |
-        mkdir -p pmos-initramfs/{bin,sbin,etc,proc,sys,dev,mnt,tmp,run,lib,usr/bin,usr/sbin}
+        mkdir -p pmos-ramdisk/{bin,sbin,dev,proc,sys,tmp,run,config,mnt,etc}
         
-        # Download busybox
-        wget -q "https://www.busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox" -O pmos-initramfs/bin/busybox || \
-        wget -q "https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox-armv8l" -O pmos-initramfs/bin/busybox
-        chmod +x pmos-initramfs/bin/busybox
+        # Download busybox arm64
+        wget -q "https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox-armv8l" -O pmos-ramdisk/bin/busybox
+        chmod +x pmos-ramdisk/bin/busybox
         
-        # Create symlinks
-        cd pmos-initramfs/bin
-        for cmd in sh ash cat cp dd echo ls mkdir mount umount ln rm sleep switch_root mknod chmod chown ifconfig ip; do
+        # Symlinks
+        cd pmos-ramdisk/bin
+        for cmd in sh ash cat cp dd echo ls mkdir mount umount ln rm sleep switch_root mknod chmod chown ifconfig; do
           ln -sf busybox $cmd
         done
         cd ../sbin
-        for cmd in init mount umount switch_root mdev; do
+        for cmd in sh init mount umount switch_root; do
           ln -sf ../bin/busybox $cmd
         done
         cd ../..
         
-        # Create PostmarketOS init
-        cat > pmos-initramfs/init << 'PMOSINIT'
+        # Init script
+        cat > pmos-ramdisk/init << 'INITSCRIPT'
         #!/bin/sh
-        export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+        export PATH=/sbin:/bin
         
         mount -t proc proc /proc
         mount -t sysfs sysfs /sys
         mount -t devtmpfs devtmpfs /dev
         mount -t tmpfs tmpfs /tmp
         mount -t tmpfs tmpfs /run
-        
-        # Parse cmdline
-        for x in $(cat /proc/cmdline); do
-          case "$x" in
-            pmos_root=*) PMOS_ROOT="${x#pmos_root=}" ;;
-            pmos_boot=*) PMOS_BOOT="${x#pmos_boot=}" ;;
-          esac
-        done
-        
-        echo "=== PostmarketOS NX669S ===" > /dev/kmsg
-        
-        # USB Peripheral mode for Qualcomm
-        echo "peripheral" > /sys/bus/platform/devices/a600000.ssusb/mode 2>/dev/null
-        
-        # Setup USB network (RNDIS)
         mkdir -p /config
         mount -t configfs none /config 2>/dev/null
         
+        echo "=== PostmarketOS NX669S ===" > /dev/kmsg
+        
+        # USB Peripheral mode
+        echo "peripheral" > /sys/bus/platform/devices/a600000.ssusb/mode 2>/dev/null
+        
+        sleep 1
+        
+        # USB Gadget RNDIS
         USB=/config/usb_gadget/g1
-        mkdir -p $USB
+        mkdir -p $USB/strings/0x409 $USB/functions/rndis.usb0 $USB/configs/c.1/strings/0x409
         echo 0x18D1 > $USB/idVendor
         echo 0x4EE0 > $USB/idProduct
-        mkdir -p $USB/strings/0x409
         echo "PostmarketOS" > $USB/strings/0x409/manufacturer
         echo "NX669S" > $USB/strings/0x409/product
-        mkdir -p $USB/functions/rndis.usb0
-        mkdir -p $USB/configs/c.1/strings/0x409
-        echo "rndis" > $USB/configs/c.1/strings/0x409/configuration
+        echo "pmos" > $USB/configs/c.1/strings/0x409/configuration
         ln -sf $USB/functions/rndis.usb0 $USB/configs/c.1/ 2>/dev/null
-        UDC=$(ls /sys/class/udc/ | head -1)
-        echo "$UDC" > $USB/UDC 2>/dev/null
+        UDC=$(ls /sys/class/udc/ 2>/dev/null | head -1)
+        [ -n "$UDC" ] && echo "$UDC" > $USB/UDC
         
         sleep 2
         
-        # Setup network
         ifconfig usb0 172.16.42.1 netmask 255.255.255.0 2>/dev/null
         ifconfig rndis0 172.16.42.1 netmask 255.255.255.0 2>/dev/null
         
-        # Telnet debug
-        /bin/busybox telnetd -l /bin/sh -p 23 2>/dev/null &
+        /bin/busybox telnetd -l /bin/sh -p 23 &
         
         echo "Telnet: 172.16.42.1:23" > /dev/kmsg
         
-        # Try mounting rootfs
-        mkdir -p /mnt/root
+        # Mount userdata
+        mkdir -p /mnt/data
+        mount /dev/block/bootdevice/by-name/userdata /mnt/data -t f2fs 2>/dev/null
         
-        # Try userdata partition
-        mount /dev/disk/by-partlabel/userdata /mnt/root -t f2fs 2>/dev/null || \
-        mount /dev/block/by-name/userdata /mnt/root -t f2fs 2>/dev/null
-        
-        if [ -f /mnt/root/pmos-rootfs.img ]; then
+        # Check for pmos rootfs
+        if [ -f /mnt/data/pmos-rootfs.img ]; then
           echo "Found PostmarketOS rootfs" > /dev/kmsg
           mkdir -p /mnt/pmos
-          mount -o loop /mnt/root/pmos-rootfs.img /mnt/pmos
-          
-          if [ -x /mnt/pmos/sbin/init ]; then
-            mount --move /dev /mnt/pmos/dev
-            mount --move /proc /mnt/pmos/proc
-            mount --move /sys /mnt/pmos/sys
+          mount -o loop /mnt/data/pmos-rootfs.img /mnt/pmos
+          if [ -d /mnt/pmos/bin ]; then
+            mount --bind /dev /mnt/pmos/dev
+            mount --bind /sys /mnt/pmos/sys
+            mount --bind /proc /mnt/pmos/proc
+            echo "Switching to PostmarketOS..." > /dev/kmsg
             exec switch_root /mnt/pmos /sbin/init
           fi
         fi
         
-        # Fallback shell
-        echo "Dropping to shell..." > /dev/kmsg
+        echo "Shell ready via telnet" > /dev/kmsg
         exec /bin/sh
-        PMOSINIT
+        INITSCRIPT
         
-        chmod +x pmos-initramfs/init
+        chmod +x pmos-ramdisk/init
         
-        # Create initramfs
-        cd pmos-initramfs
-        find . | cpio -o -H newc 2>/dev/null | gzip > ../pmos-initramfs.cpio.gz
+        cd pmos-ramdisk
+        find . | cpio -o -H newc 2>/dev/null | gzip > ../pmos-ramdisk.cpio.gz
         cd ..
-        ls -la pmos-initramfs.cpio.gz
+        ls -la pmos-ramdisk.cpio.gz
         
     - name: Create boot image
       run: |
-        KERNEL=kernel-mainline/out/arch/arm64/boot/Image
-        
         python3 mkbootimg-tools/mkbootimg.py \
-          --kernel $KERNEL \
-          --ramdisk pmos-initramfs.cpio.gz \
+          --kernel kernel \
+          --ramdisk pmos-ramdisk.cpio.gz \
           --base 0x00000000 \
           --kernel_offset 0x00008000 \
           --ramdisk_offset 0x01000000 \
           --pagesize 4096 \
           --header_version 3 \
-          --cmdline "console=ttyMSM0,115200n8 pd_ignore_unused clk_ignore_unused pmos_boot=/dev/sda1 pmos_root=/dev/sda2" \
+          --cmdline "androidboot.selinux=permissive" \
           --os_version 12.0.0 \
           --os_patch_level 2024-01 \
           -o postmarketos-nx669s.img
@@ -197,32 +150,24 @@ jobs:
         
     - name: Create Alpine rootfs image
       run: |
-        # Create minimal Alpine rootfs image
         dd if=/dev/zero of=pmos-rootfs.img bs=1M count=512
         mkfs.ext4 -L pmos pmos-rootfs.img
-        
         mkdir -p mnt
         sudo mount -o loop pmos-rootfs.img mnt
-        
-        if [ -d pmos-rootfs ]; then
-          sudo cp -a pmos-rootfs/* mnt/
-        fi
-        
-        # Add postmarketOS packages list
+        sudo cp -a alpine-rootfs/* mnt/
         sudo mkdir -p mnt/etc/apk
         echo "https://dl-cdn.alpinelinux.org/alpine/edge/main" | sudo tee mnt/etc/apk/repositories
         echo "https://dl-cdn.alpinelinux.org/alpine/edge/community" | sudo tee -a mnt/etc/apk/repositories
-        
         sudo umount mnt
         ls -la pmos-rootfs.img
         
-    - name: Upload PostmarketOS boot
+    - name: Upload boot
       uses: actions/upload-artifact@v4
       with:
         name: postmarketos-nx669s-boot
         path: postmarketos-nx669s.img
         
-    - name: Upload PostmarketOS rootfs
+    - name: Upload rootfs
       uses: actions/upload-artifact@v4
       with:
         name: postmarketos-nx669s-rootfs
@@ -239,38 +184,18 @@ jobs:
         body: |
           ## PostmarketOS for NX669S (Red Magic 6S Pro)
           
-          ### Files:
-          - `postmarketos-nx669s.img` - Boot image with mainline kernel
-          - `pmos-rootfs.img` - Alpine Linux rootfs (512MB)
+          Uses OrangeFox kernel (proven working) + Alpine Linux rootfs
           
           ### Installation:
-          1. Copy `pmos-rootfs.img` to device:
-             ```
-             adb push pmos-rootfs.img /sdcard/
-             adb shell mv /sdcard/pmos-rootfs.img /data/
-             ```
+          ```bash
+          # Push rootfs
+          adb push pmos-rootfs.img /data/
           
-          2. Boot PostmarketOS:
-             ```
-             fastboot boot postmarketos-nx669s.img
-             ```
+          # Boot
+          fastboot boot postmarketos-nx669s.img
           
-          3. Connect via USB network:
-             ```
-             # Set PC IP to 172.16.42.2
-             telnet 172.16.42.1
-             ```
-          
-          ### Features:
-          - Mainline Linux kernel
-          - USB RNDIS network
-          - Telnet debug shell
-          - Alpine Linux base
-          
-          ### Status:
-          - USB: Should work
-          - Display: Simple framebuffer (may need tuning)
-          - Touch: Untested
-          - WiFi/BT: Not working (needs firmware)
+          # Connect (set PC to 172.16.42.2)
+          telnet 172.16.42.1
+          ```
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
