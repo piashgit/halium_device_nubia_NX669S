@@ -21,100 +21,10 @@ jobs:
         git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg-tools
         pip3 install pmbootstrap
         
-    - name: Clone SM8350 mainline kernel
+    - name: Clone kernel source
       run: |
-        # Use mainline kernel with SM8350 support
-        git clone --depth=1 -b master https://github.com/jhovold/linux.git -b wip/sc8280xp-v6.7 kernel-mainline || \
-        git clone --depth=1 https://github.com/nicofee-nicofee/linux-msm.git kernel-mainline || \
-        git clone --depth=1 -b linux-6.6.y https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git kernel-mainline
-        
-    - name: Create NX669S device tree
-      run: |
-        mkdir -p kernel-mainline/arch/arm64/boot/dts/qcom
-        
-        # Create basic SM8350 NX669S device tree
-        cat > kernel-mainline/arch/arm64/boot/dts/qcom/sm8350-nubia-nx669s.dts << 'DEVICETREE'
-        // SPDX-License-Identifier: BSD-3-Clause
-        /dts-v1/;
-        
-        #include "sm8350.dtsi"
-        #include "pm8350.dtsi"
-        #include "pm8350b.dtsi"
-        #include "pm8350c.dtsi"
-        #include "pmk8350.dtsi"
-        #include "pmr735a.dtsi"
-        #include "pmr735b.dtsi"
-        
-        / {
-            model = "Nubia Red Magic 6S Pro";
-            compatible = "nubia,nx669s", "qcom,sm8350";
-            chassis-type = "handset";
-            
-            chosen {
-                #address-cells = <2>;
-                #size-cells = <2>;
-                ranges;
-                
-                framebuffer: framebuffer@e1000000 {
-                    compatible = "simple-framebuffer";
-                    reg = <0x0 0xe1000000 0x0 0x2300000>;
-                    width = <1080>;
-                    height = <2400>;
-                    stride = <(1080 * 4)>;
-                    format = "a8r8g8b8";
-                    status = "okay";
-                };
-            };
-            
-            reserved-memory {
-                cont_splash_mem: cont-splash@e1000000 {
-                    reg = <0x0 0xe1000000 0x0 0x2300000>;
-                    no-map;
-                };
-            };
-        };
-        
-        &apps_rsc {
-            regulators-0 {
-                compatible = "qcom,pm8350-rpmh-regulators";
-                qcom,pmic-id = "b";
-                
-                vreg_l1b: ldo1 {
-                    regulator-name = "vreg_l1b";
-                    regulator-min-microvolt = <912000>;
-                    regulator-max-microvolt = <920000>;
-                };
-            };
-        };
-        
-        &tlmm {
-            gpio-reserved-ranges = <52 8>;
-        };
-        
-        &ufs_mem_hc {
-            status = "okay";
-        };
-        
-        &ufs_mem_phy {
-            status = "okay";
-        };
-        
-        &usb_1 {
-            status = "okay";
-        };
-        
-        &usb_1_dwc3 {
-            dr_mode = "peripheral";
-        };
-        
-        &usb_1_hsphy {
-            status = "okay";
-        };
-        
-        &usb_1_qmpphy {
-            status = "okay";
-        };
-        DEVICETREE
+        # Use stock kernel (works with device)
+        git clone --depth=1 -b lineage-20 https://github.com/piashgit/android_kernel_nubia_sm8350.git kernel-mainline
         
     - name: Configure kernel for PostmarketOS
       run: |
@@ -122,75 +32,30 @@ jobs:
         export ARCH=arm64
         export CROSS_COMPILE=aarch64-linux-gnu-
         
-        # Use defconfig and add pmos configs
-        make defconfig
+        # Use device defconfig
+        make O=out vendor/lahaina-qgki_defconfig
         
-        cat >> .config << 'PMOSCONFIG'
-        # PostmarketOS required
+        cat >> out/.config << 'PMOSCONFIG'
         CONFIG_DEVTMPFS=y
         CONFIG_DEVTMPFS_MOUNT=y
         CONFIG_BLK_DEV_INITRD=y
         CONFIG_RD_GZIP=y
         CONFIG_TMPFS=y
-        CONFIG_TMPFS_POSIX_ACL=y
         CONFIG_VT=y
         CONFIG_VT_CONSOLE=y
-        CONFIG_UNIX98_PTYS=y
         CONFIG_EXT4_FS=y
         CONFIG_F2FS_FS=y
-        CONFIG_VFAT_FS=y
-        
-        # USB gadget
-        CONFIG_USB_GADGET=y
-        CONFIG_USB_CONFIGFS=y
-        CONFIG_USB_CONFIGFS_SERIAL=y
-        CONFIG_USB_CONFIGFS_ACM=y
-        CONFIG_USB_CONFIGFS_RNDIS=y
-        CONFIG_USB_CONFIGFS_EEM=y
-        CONFIG_USB_CONFIGFS_ECM=y
-        CONFIG_USB_ETH=m
-        CONFIG_USB_G_SERIAL=m
-        
-        # Qualcomm
-        CONFIG_ARCH_QCOM=y
-        CONFIG_QCOM_SMEM=y
-        CONFIG_QCOM_SCM=y
-        CONFIG_QCOM_RPMH=y
-        CONFIG_QCOM_PDC=y
-        CONFIG_QCOM_LLCC=y
-        CONFIG_QCOM_COMMAND_DB=y
-        
-        # Display
-        CONFIG_DRM=y
-        CONFIG_DRM_MSM=y
-        CONFIG_DRM_PANEL_SIMPLE=y
-        CONFIG_FB=y
-        CONFIG_FB_SIMPLE=y
-        CONFIG_FRAMEBUFFER_CONSOLE=y
-        
-        # Input
-        CONFIG_INPUT_EVDEV=y
-        CONFIG_INPUT_TOUCHSCREEN=y
-        CONFIG_TOUCHSCREEN_EDT_FT5X06=y
-        
-        # Network
-        CONFIG_NET=y
-        CONFIG_INET=y
-        CONFIG_IPV6=y
-        CONFIG_NETDEVICES=y
-        CONFIG_USB_NET_DRIVERS=y
-        CONFIG_USB_RTL8152=m
         PMOSCONFIG
         
-        make olddefconfig
+        make O=out olddefconfig
         
     - name: Build kernel
       run: |
         cd kernel-mainline
         export ARCH=arm64
         export CROSS_COMPILE=aarch64-linux-gnu-
-        make -j$(nproc) Image.gz dtbs || make -j$(nproc) Image
-        ls -la arch/arm64/boot/
+        make O=out -j$(nproc) Image
+        ls -la out/arch/arm64/boot/
         
     - name: Download PostmarketOS rootfs
       run: |
@@ -312,7 +177,7 @@ jobs:
         
     - name: Create boot image
       run: |
-        KERNEL=$(find kernel-mainline/arch/arm64/boot -name "Image*" | head -1)
+        KERNEL=kernel-mainline/out/arch/arm64/boot/Image
         
         python3 mkbootimg-tools/mkbootimg.py \
           --kernel $KERNEL \
