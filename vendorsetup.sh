@@ -1,0 +1,2 @@
+add_lunch_combo halium_NX669S-userdebug
+add_lunch_combo halium_NX669S-eng

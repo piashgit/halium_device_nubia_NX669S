@@ -1,0 +1,15 @@
+on early-init
+    mount debugfs debugfs /sys/kernel/debug
+    chmod 0755 /sys/kernel/debug
+
+on init
+    # Set permissions for persist partition
+    mkdir /mnt/vendor/persist 0771 root system
+
+on boot
+    # Halium - disable selinux enforcement at runtime
+    setenforce 0
+    
+    # USB
+    chown system system /sys/class/android_usb/android0/f_rndis/ethaddr
+    chmod 0660 /sys/class/android_usb/android0/f_rndis/ethaddr
