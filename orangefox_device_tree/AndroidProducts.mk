@@ -1,0 +1,5 @@
+PRODUCT_MAKEFILES := \
+    $(LOCAL_DIR)/twrp_NX669S.mk
+
+COMMON_LUNCH_CHOICES := \
+    twrp_NX669S-eng
