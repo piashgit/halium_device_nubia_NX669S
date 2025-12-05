@@ -1,0 +1,248 @@
+name: Build Halium Boot with USB Support
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    
+    steps:
+    - name: Checkout device tree
+      uses: actions/checkout@v4
+      
+    - name: Setup build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git curl wget build-essential bc bison flex libssl-dev libelf-dev python3 cpio gzip lz4 gcc-aarch64-linux-gnu android-sdk-libsparse-utils
+        git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg-tools
+        
+    - name: Download OrangeFox recovery (has working USB)
+      run: |
+        # Download OrangeFox for USB init components
+        wget -q "https://github.com/nicofee-nicofee/nicofee.gitlab.io/releases/download/recovery/OrangeFox-NX669J.img" -O orangefox.img || true
+        
+    - name: Clone kernel source
+      run: |
+        git clone --depth=1 -b lineage-20 https://github.com/nicofee-nicofee/android_kernel_nubia_sm8350 kernel
+        
+    - name: Build kernel with Halium configs
+      run: |
+        cd kernel
+        export ARCH=arm64
+        export SUBARCH=arm64  
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        
+        # Use device defconfig
+        make O=out vendor/lahaina-qgki_defconfig
+        
+        # Add Halium required configs
+        cat >> out/.config << 'HALIUM_CONFIGS'
+        CONFIG_DEVTMPFS=y
+        CONFIG_DEVTMPFS_MOUNT=y
+        CONFIG_TMPFS=y
+        CONFIG_VT=y
+        CONFIG_VT_CONSOLE=y
+        CONFIG_UNIX98_PTYS=y
+        CONFIG_ANDROID_BINDER_IPC=y
+        CONFIG_ANDROID_BINDERFS=y
+        CONFIG_ASHMEM=y
+        CONFIG_FUSE_FS=y
+        CONFIG_CGROUPS=y
+        CONFIG_CGROUP_FREEZER=y
+        CONFIG_CGROUP_DEVICE=y
+        CONFIG_CGROUP_CPUACCT=y
+        CONFIG_CGROUP_SCHED=y
+        CONFIG_NAMESPACES=y
+        CONFIG_UTS_NS=y
+        CONFIG_IPC_NS=y
+        CONFIG_USER_NS=y
+        CONFIG_PID_NS=y
+        CONFIG_NET_NS=y
+        CONFIG_SYSVIPC=y
+        CONFIG_USB_GADGET=y
+        CONFIG_USB_CONFIGFS=y
+        CONFIG_USB_CONFIGFS_F_FS=y
+        CONFIG_USB_CONFIGFS_RNDIS=y
+        CONFIG_USB_CONFIGFS_MASS_STORAGE=y
+        HALIUM_CONFIGS
+        
+        make O=out -j$(nproc) Image
+        
+    - name: Download Halium initramfs
+      run: |
+        # Download erfanoabdi's Halium ramdisk
+        wget -q "https://github.com/nicofee-nicofee/nicofee.gitlab.io/raw/main/halium/halium-ramdisk.zip" -O halium-ramdisk.zip || true
+        if [ -f halium-ramdisk.zip ]; then
+          unzip -o halium-ramdisk.zip
+          gzip -k ramdisk-halium.cpio 2>/dev/null || true
+        fi
+        
+    - name: Create Halium initramfs with USB support
+      run: |
+        mkdir -p halium-ramdisk/{dev,proc,sys,system,data,vendor,sbin,bin,lib,etc,mnt,tmp,config,android,run}
+        
+        # Download busybox
+        wget -q "https://www.busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox-armv8l" -O halium-ramdisk/bin/busybox
+        chmod +x halium-ramdisk/bin/busybox
+        
+        # Create symlinks
+        cd halium-ramdisk/bin
+        for cmd in sh ash cat cp dd echo ls mkdir mount umount ln rm sleep switch_root mknod chmod chown ifconfig; do
+          ln -sf busybox $cmd
+        done
+        cd ../sbin
+        for cmd in sh mount umount switch_root init; do
+          ln -sf ../bin/busybox $cmd
+        done
+        cd ../..
+        
+        # Create Halium init with USB support
+        cat > halium-ramdisk/init << 'HALIUM_INIT'
+        #!/bin/sh
+        export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+        
+        # Mount essential filesystems
+        mount -t proc proc /proc
+        mount -t sysfs sysfs /sys
+        mount -t devtmpfs devtmpfs /dev
+        mount -t tmpfs tmpfs /tmp
+        mount -t tmpfs tmpfs /run
+        mkdir -p /config
+        mount -t configfs none /config 2>/dev/null
+        
+        # Set USB to peripheral mode (CRITICAL for Qualcomm)
+        echo "peripheral" > /sys/bus/platform/devices/a600000.ssusb/mode 2>/dev/null
+        for udc in /sys/class/udc/*/device/../mode; do
+          echo "peripheral" > "$udc" 2>/dev/null
+        done
+        
+        sleep 1
+        
+        # Setup USB Gadget via configfs
+        USB_GADGET=/config/usb_gadget/g1
+        mkdir -p $USB_GADGET
+        echo 0x18D1 > $USB_GADGET/idVendor
+        echo 0xD001 > $USB_GADGET/idProduct
+        mkdir -p $USB_GADGET/strings/0x409
+        echo "NX669S" > $USB_GADGET/strings/0x409/serialnumber
+        echo "Halium" > $USB_GADGET/strings/0x409/manufacturer
+        echo "Ubuntu Touch" > $USB_GADGET/strings/0x409/product
+        
+        # Setup RNDIS for network
+        mkdir -p $USB_GADGET/functions/rndis.usb0
+        mkdir -p $USB_GADGET/configs/c.1/strings/0x409
+        echo "rndis" > $USB_GADGET/configs/c.1/strings/0x409/configuration
+        echo 500 > $USB_GADGET/configs/c.1/MaxPower
+        ln -sf $USB_GADGET/functions/rndis.usb0 $USB_GADGET/configs/c.1/ 2>/dev/null
+        
+        # Enable USB gadget
+        UDC=$(ls /sys/class/udc/ | head -1)
+        echo "$UDC" > $USB_GADGET/UDC 2>/dev/null
+        
+        sleep 2
+        
+        # Setup network interface
+        ifconfig rndis0 192.168.2.15 netmask 255.255.255.0 2>/dev/null
+        ifconfig usb0 192.168.2.15 netmask 255.255.255.0 2>/dev/null
+        
+        # Start telnet for debug
+        /bin/busybox telnetd -l /bin/sh -p 23 2>/dev/null &
+        
+        echo "=== Halium NX669S USB Ready ===" > /dev/kmsg
+        echo "Telnet: 192.168.2.15:23" > /dev/kmsg
+        
+        # Mount userdata
+        mkdir -p /data
+        mount /dev/block/by-name/userdata /data -t f2fs 2>/dev/null || \
+        mount /dev/block/bootdevice/by-name/userdata /data -t f2fs 2>/dev/null
+        
+        # Check for Ubuntu Touch rootfs
+        if [ -f /data/rootfs-fresh.img ]; then
+          echo "Found Ubuntu Touch rootfs" > /dev/kmsg
+          mkdir -p /ubuntu
+          mount -o loop /data/rootfs-fresh.img /ubuntu
+          
+          if [ -d /ubuntu/bin ]; then
+            mount --bind /dev /ubuntu/dev
+            mount --bind /sys /ubuntu/sys
+            mount --bind /proc /ubuntu/proc
+            mount -t devpts devpts /ubuntu/dev/pts 2>/dev/null
+            
+            # Mount Android for libhybris
+            if [ -f /data/android-rootfs.img ]; then
+              mkdir -p /ubuntu/android
+              mount -o loop /data/android-rootfs.img /ubuntu/android
+            fi
+            
+            echo "Switching to Ubuntu Touch..." > /dev/kmsg
+            exec switch_root /ubuntu /sbin/init
+          fi
+        fi
+        
+        # Fallback: stay in initramfs shell
+        echo "No rootfs found, staying in initramfs" > /dev/kmsg
+        exec /bin/sh
+        HALIUM_INIT
+        
+        chmod +x halium-ramdisk/init
+        
+    - name: Create Halium boot image
+      run: |
+        # Create ramdisk
+        cd halium-ramdisk
+        find . | cpio -o -H newc 2>/dev/null | gzip > ../halium-ramdisk.cpio.gz
+        cd ..
+        
+        # Create boot image
+        python3 mkbootimg-tools/mkbootimg.py \
+          --kernel kernel/out/arch/arm64/boot/Image \
+          --ramdisk halium-ramdisk.cpio.gz \
+          --base 0x00000000 \
+          --kernel_offset 0x00008000 \
+          --ramdisk_offset 0x01000000 \
+          --pagesize 4096 \
+          --header_version 3 \
+          --cmdline "console=ttyMSM0,115200n8 androidboot.hardware=qcom androidboot.selinux=permissive" \
+          --os_version 12.0.0 \
+          --os_patch_level 2024-01 \
+          -o halium-boot-nx669s.img
+          
+        # Pad to 100MB
+        truncate -s 100663296 halium-boot-nx669s.img
+        
+        ls -la halium-boot-nx669s.img
+        
+    - name: Upload Halium boot
+      uses: actions/upload-artifact@v4
+      with:
+        name: halium-boot-nx669s-usb
+        path: halium-boot-nx669s.img
+        
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: halium-v${{ github.run_number }}
+        name: Halium Boot NX669S v${{ github.run_number }}
+        files: halium-boot-nx669s.img
+        body: |
+          ## Halium Boot for NX669S (Red Magic 6S Pro)
+          
+          ### Features:
+          - USB gadget support with RNDIS
+          - Telnet debug on 192.168.2.15:23
+          - Auto-mount Ubuntu Touch from /data/rootfs-fresh.img
+          
+          ### Usage:
+          1. Flash Ubuntu Touch GSI first
+          2. `fastboot boot halium-boot-nx669s.img`
+          3. Connect via: `telnet 192.168.2.15`
+          
+          ### Requirements:
+          - Ubuntu Touch rootfs at `/data/rootfs-fresh.img`
+          - Android rootfs at `/data/android-rootfs.img` (optional, for libhybris)
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
