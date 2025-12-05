@@ -1,0 +1,163 @@
+name: Build Halium Boot
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: 'Kernel branch to use'
+        required: false
+        default: 'lineage-20'
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - name: Checkout device tree
+      uses: actions/checkout@v4
+      
+    - name: Setup build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          git curl wget \
+          build-essential bc bison flex libssl-dev \
+          libelf-dev python3 python3-pip \
+          abootimg mkbootimg cpio gzip lz4 \
+          device-tree-compiler gcc-aarch64-linux-gnu \
+          crossbuild-essential-arm64
+        
+        # Install mkbootimg from Android tools
+        pip3 install mkbootimg
+        
+    - name: Clone kernel source
+      run: |
+        git clone --depth=1 -b ${{ github.event.inputs.kernel_branch || 'lineage-20' }} \
+          https://github.com/piashgit/android_kernel_nubia_sm8350 kernel
+          
+    - name: Setup Halium initramfs
+      run: |
+        # Clone halium-boot (generic initramfs)
+        git clone --depth=1 https://github.com/halium/initramfs-tools-halium halium-initramfs
+        
+        # Create minimal halium ramdisk
+        mkdir -p ramdisk/{dev,proc,sys,system,data,vendor}
+        
+        # Create init script for Halium
+        cat > ramdisk/init << 'INITEOF'
+        #!/bin/sh
+        
+        mount -t proc proc /proc
+        mount -t sysfs sysfs /sys
+        mount -t devtmpfs devtmpfs /dev
+        
+        # Halium boot
+        export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+        
+        # Mount system
+        mount -o ro /dev/block/by-name/system_a /system 2>/dev/null || \
+        mount -o ro /dev/block/by-name/system /system
+        
+        # Switch root to Ubuntu Touch
+        if [ -f /system/ubuntu/init ]; then
+            exec switch_root /system/ubuntu /init
+        fi
+        
+        # Fallback - start shell
+        exec /bin/sh
+        INITEOF
+        chmod +x ramdisk/init
+        
+    - name: Build kernel
+      run: |
+        cd kernel
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        
+        # Use NX669S defconfig
+        make O=out vendor/lahaina-qgki_defconfig vendor/lahaina-NX669S_diff
+        
+        # Enable Halium required configs
+        cat >> out/.config << 'CONFIGEOF'
+        # Halium required
+        CONFIG_VT=y
+        CONFIG_VT_CONSOLE=y
+        CONFIG_DEVTMPFS=y
+        CONFIG_DEVTMPFS_MOUNT=y
+        CONFIG_TMPFS=y
+        CONFIG_UNIX=y
+        CONFIG_SYSFS=y
+        CONFIG_PROC_FS=y
+        CONFIG_FHANDLE=y
+        CONFIG_CRYPTO_USER=y
+        CONFIG_NET=y
+        CONFIG_PACKET=y
+        CONFIG_UNIX_DIAG=y
+        CONFIG_NET_KEY=y
+        CONFIG_INET=y
+        CONFIG_IP_MULTICAST=y
+        CONFIG_IP_ADVANCED_ROUTER=y
+        CONFIG_IP_MULTIPLE_TABLES=y
+        CONFIG_NETFILTER=y
+        CONFIG_ANDROID_BINDER_IPC=y
+        CONFIG_ASHMEM=y
+        CONFIGEOF
+        
+        # Build
+        make O=out -j$(nproc) Image
+        
+    - name: Create Halium boot image
+      run: |
+        # Create ramdisk cpio
+        cd ramdisk
+        find . | cpio -o -H newc | gzip > ../ramdisk.cpio.gz
+        cd ..
+        
+        # Get kernel
+        KERNEL=kernel/out/arch/arm64/boot/Image
+        
+        # Create boot.img with header v3 (Android 12)
+        python3 -m mkbootimg \
+          --kernel $KERNEL \
+          --ramdisk ramdisk.cpio.gz \
+          --base 0x00000000 \
+          --kernel_offset 0x00008000 \
+          --ramdisk_offset 0x01000000 \
+          --pagesize 4096 \
+          --header_version 3 \
+          --cmdline "console=ttyMSM0,115200n8 androidboot.hardware=qcom androidboot.console=ttyMSM0 androidboot.memcg=1 lpm_levels.sleep_disabled=1 msm_rtb.filter=0x237 service_locator.enable=1 androidboot.usbcontroller=a600000.dwc3 swiotlb=0 loop.max_part=7 cgroup.memory=nokmem,nosocket androidboot.selinux=permissive" \
+          --os_version 12.0.0 \
+          --os_patch_level 2024-01 \
+          -o halium-boot-nx669s.img
+          
+        ls -la halium-boot-nx669s.img
+        
+    - name: Upload Halium boot image
+      uses: actions/upload-artifact@v4
+      with:
+        name: halium-boot-nx669s
+        path: halium-boot-nx669s.img
+        
+    - name: Create Release
+      if: github.event_name == 'workflow_dispatch'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: halium-boot-${{ github.run_number }}
+        name: Halium Boot NX669S Build ${{ github.run_number }}
+        files: halium-boot-nx669s.img
+        body: |
+          ## Halium Boot Image for Nubia Red Magic 6S Pro (NX669S)
+          
+          **Device:** NX669S (Red Magic 6S Pro)
+          **SoC:** Snapdragon 888+ (lahaina)
+          **Kernel:** ${{ github.event.inputs.kernel_branch || 'lineage-20' }}
+          
+          ### Flash Instructions
+          ```bash
+          fastboot flash boot halium-boot-nx669s.img
+          ```
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
